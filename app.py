@@ -60,9 +60,9 @@ st.markdown(
     @media (max-width: 768px) {
         section.main > div:first-child { padding-top: 3.2rem; }
     }
-    .block-container { padding-bottom: 2.0rem; }
+    .block-container { padding-bottom: 5.0rem; }
     @media (max-width: 768px) {
-        .block-container { padding-bottom: 6.0rem; }
+        .block-container { padding-bottom: 8.0rem; }
     }
 
     /* radio → 버튼처럼 */

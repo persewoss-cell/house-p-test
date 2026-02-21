@@ -4824,7 +4824,7 @@ def render_lottery_admin():
     else:
         st.info("개시된 복권이 없습니다.")
 
-    st.markdown("### 관리자 복권 참여")
+    st.markdown("### 👑 관리자 복권 참여")
     ad1, ad2 = st.columns([2, 1])
     with ad1:
         admin_join_count = st.number_input("복권 참여 수", min_value=1, value=1, step=1, key="lot_admin_join_count")

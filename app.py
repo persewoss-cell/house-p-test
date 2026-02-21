@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import random
 from decimal import Decimal, ROUND_HALF_UP
 
 # ✅ Altair(차트) - 없어도 앱이 죽지 않게 안전 import
@@ -1249,6 +1250,7 @@ def api_buy_lottery(name: str, pin: str, numbers: list[int]):
     try:
         new_bal = _do(db.transaction())
         clear_student_read_cache()
+        get_my_lottery_entries_cached.clear()
         return {"ok": True, "balance": int(new_bal)}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
@@ -1290,6 +1292,79 @@ def api_list_lottery_entries(round_id: str):
     return {"ok": True, "rows": rows}
 
 
+def api_lottery_entry_summary(round_id: str):
+    rid = str(round_id or "")
+    if not rid:
+        return {"ok": True, "participants": 0, "ticket_count": 0, "total_amount": 0}
+
+    round_snap = db.collection("lottery_rounds").document(rid).get()
+    if not round_snap.exists:
+        return {"ok": False, "error": "회차 정보를 찾을 수 없습니다."}
+
+    rd = round_snap.to_dict() or {}
+    ticket_price = int(rd.get("price", rd.get("ticket_price", 20)) or 20)
+    entries = list(db.collection("lottery_entries").where(filter=FieldFilter("round_id", "==", rid)).stream())
+    participants = set()
+    for e in entries:
+        x = e.to_dict() or {}
+        sid = str(x.get("student_id", "") or "").strip()
+        if sid:
+            participants.add(sid)
+    ticket_count = len(entries)
+    return {
+        "ok": True,
+        "participants": len(participants),
+        "ticket_count": int(ticket_count),
+        "total_amount": int(ticket_count * ticket_price),
+    }
+
+
+def api_admin_join_lottery(admin_pin: str, join_count: int):
+    if not is_admin_pin(admin_pin):
+        return {"ok": False, "error": "관리자 PIN이 틀립니다."}
+
+    join_count = int(join_count or 0)
+    if join_count <= 0:
+        return {"ok": False, "error": "참여 횟수는 1 이상이어야 합니다."}
+
+    st_info = _api_get_lottery_state_uncached()
+    if not st_info.get("active"):
+        return {"ok": False, "error": "개시된 복권이 없습니다."}
+
+    round_id = str(st_info.get("round_id", "") or "")
+    round_no = int(st_info.get("round_no", 0) or 0)
+    price = int(st_info.get("price", 20) or 20)
+
+    round_ref = db.collection("lottery_rounds").document(round_id)
+    r_snap = round_ref.get()
+    if not r_snap.exists:
+        return {"ok": False, "error": "회차 정보를 찾을 수 없습니다."}
+    rd = r_snap.to_dict() or {}
+    if str(rd.get("status", "")) != "open":
+        return {"ok": False, "error": "진행 중인 복권이 없습니다."}
+
+    batch = db.batch()
+    for _ in range(join_count):
+        nums = sorted(random.sample(range(1, 21), 4))
+        ref = db.collection("lottery_entries").document()
+        batch.set(
+            ref,
+            {
+                "round_id": round_id,
+                "round_no": int(round_no),
+                "student_id": "__admin__",
+                "student_no": 0,
+                "student_name": ADMIN_NAME,
+                "numbers": nums,
+                "submitted_at": firestore.SERVER_TIMESTAMP,
+                "ticket_price": int(price),
+            },
+        )
+    batch.commit()
+    get_my_lottery_entries_cached.clear()
+    return {"ok": True, "count": int(join_count)}
+
+        
 def api_submit_lottery_draw(admin_pin: str, draw_numbers: list[int]):
     if not is_admin_pin(admin_pin):
         return {"ok": False, "error": "관리자 PIN이 틀립니다."}
@@ -4742,9 +4817,39 @@ def render_lottery_admin():
     else:
         st.info("개시된 복권이 없습니다.")
 
+    st.markdown("### 관리자 복권 참여")
+    ad1, ad2 = st.columns([2, 1])
+    with ad1:
+        admin_join_count = st.number_input("복권 참여 수", min_value=1, value=1, step=1, key="lot_admin_join_count")
+    with ad2:
+        st.caption("")
+        if st.button("복권 참여", use_container_width=True, key="lottery_admin_join_btn"):
+            res = api_admin_join_lottery(ADMIN_PIN, int(admin_join_count))
+            if res.get("ok"):
+                toast(f"관리자 복권 참여 완료 ({int(res.get('count', 0))}건)", icon="🎟️")
+                st.rerun()
+            else:
+                st.error(res.get("error", "관리자 복권 참여 실패"))
+
     st.markdown("### 📝 복권 참여 결과")
     rrid = str(st_info.get("round_id", "") or "")
     if rrid:
+        summary = api_lottery_entry_summary(rrid)
+        if summary.get("ok"):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "참여자수": int(summary.get("participants", 0) or 0),
+                            "참여 복권수": int(summary.get("ticket_count", 0) or 0),
+                            "총 액수": int(summary.get("total_amount", 0) or 0),
+                        }
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            
         ent = api_list_lottery_entries(rrid)
         df_ent = pd.DataFrame(ent.get("rows", [])) if ent.get("ok") else pd.DataFrame()
         if not df_ent.empty:
@@ -4923,6 +5028,8 @@ def render_lottery_user(name: str, pin: str, student_id: str, balance: int):
             st.dataframe(pd.DataFrame(view_rows), use_container_width=True, hide_index=True)
         else:
             st.info("아직 구매 내역이 없습니다.")
+    else:
+        st.info("개시된 복권이 없습니다.")
 
 # =========================
 # 관리자 화면

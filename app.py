@@ -1507,12 +1507,19 @@ def api_pay_lottery_prizes(admin_pin: str, round_id: str):
         if not student_id or prize <= 0:
             d.reference.update({"paid": True, "paid_at": firestore.SERVER_TIMESTAMP})
             continue
+        if student_id == "__admin__" or "/" in student_id:
+            d.reference.update({"paid": True, "paid_at": firestore.SERVER_TIMESTAMP})
+            continue
         student_ref = db.collection("students").document(student_id)
+        snap = student_ref.get()
+        if not snap.exists:
+            d.reference.update({"paid": True, "paid_at": firestore.SERVER_TIMESTAMP})
+            continue
         tx_ref = db.collection("transactions").document()
         @firestore.transactional
         def _do(transaction):
-            snap = student_ref.get(transaction=transaction)
-            bal = int((snap.to_dict() or {}).get("balance", 0) or 0)
+            tx_snap = student_ref.get(transaction=transaction)
+            bal = int((tx_snap.to_dict() or {}).get("balance", 0) or 0)
             new_bal = bal + prize
             transaction.update(student_ref, {"balance": new_bal})
             transaction.set(tx_ref, {
@@ -4833,7 +4840,13 @@ def render_lottery_admin():
 
     st.markdown("### 📝 복권 참여 결과")
     rrid = str(st_info.get("round_id", "") or "")
+    round_status = ""
     if rrid:
+        r_snap = db.collection("lottery_rounds").document(rrid).get()
+        if r_snap.exists:
+            round_status = str((r_snap.to_dict() or {}).get("status", "") or "")
+
+    if rrid and round_status == "closed":
         summary = api_lottery_entry_summary(rrid)
         if summary.get("ok"):
             st.dataframe(
@@ -4855,10 +4868,12 @@ def render_lottery_admin():
         if not df_ent.empty:
             st.dataframe(df_ent[["참여 일시", "이름", "복권 참여 번호"]], use_container_width=True, hide_index=True)
         else:
-            st.info("개시된 복권이 없습니다.")
+            st.info("참여 내역이 없습니다.")
+    elif rrid and round_status == "open":
+        st.info("복권 마감 후 참여 결과가 표시됩니다.")
     else:
-        st.info("개시된 복권이 없습니다.")
-
+        st.info("회차 정보가 없습니다.")
+        
     st.markdown("### 🎰 복권 추첨하기")
     d1, d2, d3, d4 = st.columns(4)
     with d1:

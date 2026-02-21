@@ -975,6 +975,7 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner:
     total = sum(int(x.get("amount", 0) or 0) for x in bid_rows)
     refunded_count = 0
     refunded_total = 0
+    refunded_fee_total = 0
 
     if refund_non_winner and bid_rows:
         sorted_rows = sorted(
@@ -987,8 +988,13 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner:
 
         for loser in loser_rows:
             sid = str(loser.get("student_id", "") or "")
-            refund_amount = int(loser.get("amount", 0) or 0)
-            if not sid or refund_amount <= 0:
+            bid_amount = int(loser.get("amount", 0) or 0)
+            if not sid or bid_amount <= 0:
+                continue
+
+            fee_amount = int(Decimal(bid_amount * Decimal("0.10")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            refund_amount = int(max(0, bid_amount - fee_amount))
+            if refund_amount <= 0:
                 continue
 
             student_ref = db.collection("students").document(sid)
@@ -1004,12 +1010,13 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner:
                     "type": "auction_bid_refund",
                     "amount": int(refund_amount),
                     "balance_after": int(new_bal),
-                    "memo": refund_memo,
+                    "memo": f"{refund_memo} (수수료 10% 차감)",
                     "created_at": firestore.SERVER_TIMESTAMP,
                 }
             )
             refunded_count += 1
             refunded_total += refund_amount
+            refunded_fee_total += fee_amount
 
         total = int(winner.get("amount", 0) or 0)
         
@@ -1024,6 +1031,7 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner:
             "refund_non_winner": bool(refund_non_winner),
             "refunded_count": int(refunded_count),
             "refunded_total": int(refunded_total),
+            "refunded_fee_total": int(refunded_fee_total),
             "created_at": firestore.SERVER_TIMESTAMP,
         }
     )
@@ -1036,6 +1044,7 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner:
         "refund_non_winner": bool(refund_non_winner),
         "refunded_count": int(refunded_count),
         "refunded_total": int(refunded_total),
+        "refunded_fee_total": int(refunded_fee_total),
     }
 
 
@@ -1047,6 +1056,7 @@ def api_list_auction_ledgers(limit=50):
         refund_enabled = bool(x.get("refund_non_winner", False))
         refunded_count = int(x.get("refunded_count", 0) or 0)
         refunded_total = int(x.get("refunded_total", 0) or 0)
+        refunded_fee_total = int(x.get("refunded_fee_total", 0) or 0)
         rows.append(
             {
                 "입찰번호": int(x.get("round_no", 0) or 0),
@@ -1057,6 +1067,7 @@ def api_list_auction_ledgers(limit=50):
                 "낙찰금 반환": "적용" if refund_enabled else "미적용",
                 "반환 인원": refunded_count,
                 "반환 금액": refunded_total,
+                "차감 수수료": refunded_fee_total,
             }
         )
     return {"ok": True, "rows": rows}
@@ -1382,6 +1393,12 @@ def api_lottery_entry_summary(round_id: str):
         "ticket_count": int(ticket_count),
         "total_amount": int(ticket_count * ticket_price),
     }
+
+
+def _render_lottery_join_status(summary: dict):
+    ticket_count = int(summary.get("ticket_count", 0) or 0)
+    total_amount = int(summary.get("total_amount", 0) or 0)
+    st.success(f"복권 참여수 {ticket_count:02d}  |  총액 {total_amount}")
 
 
 def api_admin_join_lottery(admin_pin: str, join_count: int):
@@ -4903,8 +4920,13 @@ def render_lottery_admin():
             else:
                 st.error(res.get("error", "관리자 복권 참여 실패"))
 
-    st.markdown("### 📝 복권 참여 결과")
     rrid = str(st_info.get("round_id", "") or "")
+    if rrid:
+        summary_open = api_lottery_entry_summary(rrid)
+        if summary_open.get("ok"):
+            _render_lottery_join_status(summary_open)
+
+    st.markdown("### 📝 복권 참여 결과")
     round_status = ""
     if rrid:
         r_snap = db.collection("lottery_rounds").document(rrid).get()
@@ -4963,6 +4985,23 @@ def render_lottery_admin():
 
     st.markdown("### 🎉 당첨자 확인")
     if rrid:
+        has_draw_numbers = len(st_info.get("draw_numbers") or []) == 4
+
+        def render_lottery_pay_and_ledger_button():
+            if not has_draw_numbers:
+                return
+            if st.button("당첨금 지급 및 장부 반영", use_container_width=True, key="lottery_pay_and_ledger_btn"):
+                rp = api_pay_lottery_prizes(ADMIN_PIN, rrid)
+                if not rp.get("ok"):
+                    st.error(rp.get("error", "당첨금 지급 실패"))
+                else:
+                    rl = api_reflect_lottery_ledger(ADMIN_PIN, rrid)
+                    if rl.get("ok"):
+                        toast(f"당첨금 지급 및 장부 반영 완료 ({int(rp.get('count', 0))}건)", icon="📒")
+                        st.rerun()
+                    else:
+                        st.error(rl.get("error", "장부 반영 실패"))
+
         ws = api_get_lottery_winners(rrid)
         df_w = pd.DataFrame(ws.get("rows", [])) if ws.get("ok") else pd.DataFrame()
         if not df_w.empty:
@@ -4998,20 +5037,13 @@ def render_lottery_admin():
                 "</table>"
             )
             st.markdown(winners_html, unsafe_allow_html=True)
-            
-            if st.button("당첨금 지급 및 장부 반영", use_container_width=True, key="lottery_pay_and_ledger_btn"):
-                rp = api_pay_lottery_prizes(ADMIN_PIN, rrid)
-                if not rp.get("ok"):
-                    st.error(rp.get("error", "당첨금 지급 실패"))
-                else:
-                    rl = api_reflect_lottery_ledger(ADMIN_PIN, rrid)
-                    if rl.get("ok"):
-                        toast(f"당첨금 지급 및 장부 반영 완료 ({int(rp.get('count', 0))}건)", icon="📒")
-                        st.rerun()
-                    else:
-                        st.error(rl.get("error", "장부 반영 실패"))
+            render_lottery_pay_and_ledger_button()
         else:
-            st.info("당첨자가 없습니다.")
+            if has_draw_numbers:
+                st.info("당첨자가 없습니다.")
+            else:
+                st.info("당첨번호 제출 후 당첨자를 확인할 수 있습니다.")
+            render_lottery_pay_and_ledger_button()
     else:
         st.info("회차 정보가 없습니다.")
 
@@ -6158,3 +6190,8 @@ with sub4:
 # =========================
 with sub5:
     render_lottery_user(name, pin, str(student_id or ""), int(st.session_state.data.get(name, {}).get("balance", balance)))
+    
+
+
+
+

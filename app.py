@@ -48,6 +48,7 @@ st.session_state.setdefault("tpl_sort_panel_open", False)
 st.session_state.setdefault("tpl_sort_mode", "기본")
 st.session_state.setdefault("tpl_mobile_sort_ui", False)
 st.session_state.setdefault("tpl_work_ids", [])
+st.session_state.setdefault("auction_refund_non_winner", True)
 
 
 # =========================
@@ -944,7 +945,7 @@ def api_get_auction_results(round_id: str):
     }
 
 
-def api_reflect_auction_ledger(admin_pin: str, round_id: str):
+def api_reflect_auction_ledger(admin_pin: str, round_id: str, refund_non_winner: bool = False):
     if not is_admin_pin(admin_pin):
         return {"ok": False, "error": "관리자 PIN이 틀립니다."}
     if not round_id:
@@ -959,10 +960,59 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str):
         return {"ok": False, "error": "이미 장부에 반영된 경매입니다."}
 
     bids = list(db.collection("auction_bids").where(filter=FieldFilter("round_id", "==", round_id)).stream())
-    total = 0
+    bid_rows = []
     for b in bids:
-        total += int((b.to_dict() or {}).get("amount", 0) or 0)
+        bx = b.to_dict() or {}
+        bid_rows.append(
+            {
+                "student_id": str(bx.get("student_id", "") or ""),
+                "student_name": str(bx.get("student_name", "") or ""),
+                "amount": int(bx.get("amount", 0) or 0),
+                "submitted_at": _to_utc_datetime(bx.get("submitted_at")),
+            }
+        )
 
+    total = sum(int(x.get("amount", 0) or 0) for x in bid_rows)
+    refunded_count = 0
+    refunded_total = 0
+
+    if refund_non_winner and bid_rows:
+        sorted_rows = sorted(
+            bid_rows,
+            key=lambda x: (-int(x.get("amount", 0) or 0), x.get("submitted_at") or datetime.max.replace(tzinfo=timezone.utc)),
+        )
+        winner = sorted_rows[0]
+        loser_rows = sorted_rows[1:]
+        refund_memo = f"경매 입찰금 반환 {int(rd.get('round_no', 0) or 0):02d}회차"
+
+        for loser in loser_rows:
+            sid = str(loser.get("student_id", "") or "")
+            refund_amount = int(loser.get("amount", 0) or 0)
+            if not sid or refund_amount <= 0:
+                continue
+
+            student_ref = db.collection("students").document(sid)
+            snap = student_ref.get()
+            if not snap.exists:
+                continue
+            bal = int((snap.to_dict() or {}).get("balance", 0) or 0)
+            new_bal = bal + refund_amount
+            student_ref.update({"balance": int(new_bal)})
+            db.collection("transactions").add(
+                {
+                    "student_id": sid,
+                    "type": "auction_bid_refund",
+                    "amount": int(refund_amount),
+                    "balance_after": int(new_bal),
+                    "memo": refund_memo,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                }
+            )
+            refunded_count += 1
+            refunded_total += refund_amount
+
+        total = int(winner.get("amount", 0) or 0)
+        
     db.collection("auction_ledgers").add(
         {
             "round_id": round_id,
@@ -971,13 +1021,22 @@ def api_reflect_auction_ledger(admin_pin: str, round_id: str):
             "bid_date": rd.get("opened_at"),
             "participants": len(bids),
             "total_amount": int(total),
+            "refund_non_winner": bool(refund_non_winner),
+            "refunded_count": int(refunded_count),
+            "refunded_total": int(refunded_total),
             "created_at": firestore.SERVER_TIMESTAMP,
         }
     )
     round_ref.update({"ledger_reflected": True, "ledger_reflected_at": firestore.SERVER_TIMESTAMP})
     clear_auction_state_cache()
     clear_auction_view_cache()
-    return {"ok": True}
+    clear_student_read_cache()
+    return {
+        "ok": True,
+        "refund_non_winner": bool(refund_non_winner),
+        "refunded_count": int(refunded_count),
+        "refunded_total": int(refunded_total),
+    }
 
 
 def api_list_auction_ledgers(limit=50):
@@ -985,6 +1044,9 @@ def api_list_auction_ledgers(limit=50):
     rows = []
     for d in q:
         x = d.to_dict() or {}
+        refund_enabled = bool(x.get("refund_non_winner", False))
+        refunded_count = int(x.get("refunded_count", 0) or 0)
+        refunded_total = int(x.get("refunded_total", 0) or 0)
         rows.append(
             {
                 "입찰번호": int(x.get("round_no", 0) or 0),
@@ -992,6 +1054,9 @@ def api_list_auction_ledgers(limit=50):
                 "입찰내역": str(x.get("bid_title", "") or ""),
                 "입찰 참가수": int(x.get("participants", 0) or 0),
                 "총 액수": int(x.get("total_amount", 0) or 0),
+                "낙찰금 반환": "적용" if refund_enabled else "미적용",
+                "반환 인원": refunded_count,
+                "반환 금액": refunded_total,
             }
         )
     return {"ok": True, "rows": rows}
@@ -5707,7 +5772,7 @@ if st.session_state.admin_ok:
                         excel_filename = f"auction_result_{int(rd.get('round_no', 0)):02d}.csv"
 
                     out.seek(0)
-                    b_x, b_l = st.columns(2)
+                    b_x, b_c, b_l = st.columns([1, 1, 1])
                     with b_x:
                         st.download_button(
                             "엑셀저장",
@@ -5717,12 +5782,27 @@ if st.session_state.admin_ok:
                             use_container_width=True,
                             key="auction_excel_btn",
                         )
+                    with b_c:
+                        refund_non_winner = st.checkbox(
+                            "낙찰금 반환",
+                            key="auction_refund_non_winner",
+                        )
                     with b_l:
                         if st.button("장부반영", use_container_width=True, key="auction_ledger_btn"):
-                            res = api_reflect_auction_ledger(ADMIN_PIN, latest_round_id)
+                            res = api_reflect_auction_ledger(
+                                ADMIN_PIN,
+                                latest_round_id,
+                                refund_non_winner=bool(refund_non_winner),
+                            )
                             if res.get("ok"):
-                                toast("경매 관리 장부 반영 완료", icon="📒")
-                                st.rerun()
+                                if bool(res.get("refund_non_winner", False)):
+                                    toast(
+                                        f"경매 관리 장부 반영 완료 · 반환 {int(res.get('refunded_count', 0) or 0)}명 / {int(res.get('refunded_total', 0) or 0)}원",
+                                        icon="📒",
+                                    )
+                                else:
+                                    toast("경매 관리 장부 반영 완료", icon="📒")
+                                    st.rerun()
                             else:
                                 st.error(res.get("error", "장부 반영 실패"))
             else:

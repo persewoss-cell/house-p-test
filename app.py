@@ -5705,7 +5705,6 @@ if st.session_state.admin_ok:
                         out = io.BytesIO(df_rr.to_csv(index=False).encode("utf-8-sig"))
                         excel_mime = "text/csv"
                         excel_filename = f"auction_result_{int(rd.get('round_no', 0)):02d}.csv"
-                        st.warning("엑셀 저장 엔진을 찾지 못해 CSV 파일로 저장합니다.")
 
                     out.seek(0)
                     b_x, b_l = st.columns(2)
